@@ -5,9 +5,10 @@ require("dotenv").config();
 
 const transcodedFolder = process.env.TRANSCODED_FOLDER_PATH;
 const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS || "1");
-const SEGMENT_DURATION = parseInt(process.env.SEGMENT_DURATION || "10");
+const SEGMENT_DURATION = parseInt(process.env.SEGMENT_DURATION || "20");
 const USE_HARDWARE_ACCELERATION =
   process.env.USE_HARDWARE_ACCELERATION !== "false"; // Default to true
+const QUALITY_PRESET = process.env.QUALITY_PRESET || "medium";
 
 // Queue for processing videos sequentially
 const videoQueue = [];
@@ -22,17 +23,24 @@ function isVideoAlreadyTranscoded(fileName) {
   const outputDir = path.join(transcodedFolder, fileName);
   const masterPlaylistPath = path.join(outputDir, "master.m3u8");
 
-  // Check if the master playlist exists
   if (fs.existsSync(masterPlaylistPath)) {
-    // Read master playlist to check what resolutions were created
     const masterContent = fs.readFileSync(masterPlaylistPath, "utf8");
     const playlistLines = masterContent
       .split("\n")
       .filter((line) => !line.startsWith("#") && line.trim().length > 0);
 
-    // Check if all referenced playlists exist
     return playlistLines.every((playlist) => {
-      return fs.existsSync(path.join(outputDir, playlist));
+      const playlistPath = path.join(outputDir, playlist);
+      if (!fs.existsSync(playlistPath)) return false;
+
+      const playlistContent = fs.readFileSync(playlistPath, "utf8");
+      const segmentLines = playlistContent
+        .split("\n")
+        .filter((line) => line.endsWith(".ts"));
+
+      return segmentLines.every((segment) =>
+        fs.existsSync(path.join(path.dirname(playlistPath), segment))
+      );
     });
   }
 
@@ -42,7 +50,22 @@ function isVideoAlreadyTranscoded(fileName) {
 function isResolutionTranscoded(fileName, resolution) {
   const resolutionDir = path.join(transcodedFolder, fileName, resolution);
   const playlistPath = path.join(resolutionDir, "playlist.m3u8");
-  return fs.existsSync(playlistPath);
+
+  if (fs.existsSync(playlistPath)) {
+    const playlistContent = fs.readFileSync(playlistPath, "utf8");
+    const segmentLines = playlistContent
+      .split("\n")
+      .filter((line) => line.endsWith(".ts"));
+
+    return (
+      segmentLines.length > 0 &&
+      segmentLines.every((segment) =>
+        fs.existsSync(path.join(resolutionDir, segment))
+      )
+    );
+  }
+
+  return false;
 }
 
 function getVideoMetadata(filePath) {
@@ -71,12 +94,23 @@ function getVideoMetadata(filePath) {
   });
 }
 
+function getQualityPresetSettings(preset) {
+  const presets = {
+    low: { crf: 28, preset: "faster" },
+    medium: { crf: 23, preset: "medium" },
+    high: { crf: 18, preset: "slow" },
+  };
+  return presets[preset] || presets.medium;
+}
+
 function determineResolutions(height) {
-  // Only include resolutions that are lower than or equal to the original
+  const qualitySettings = getQualityPresetSettings(QUALITY_PRESET);
   const allResolutions = [
-    { name: "480p", height: 480, bitrate: "1000k" },
-    { name: "720p", height: 720, bitrate: "2500k" },
-    { name: "1080p", height: 1080, bitrate: "5000k" },
+    { name: "480p", height: 480, bitrate: "1000k", ...qualitySettings },
+    { name: "720p", height: 720, bitrate: "2500k", ...qualitySettings },
+    { name: "1080p", height: 1080, bitrate: "5000k", ...qualitySettings },
+    { name: "1440p", height: 1440, bitrate: "8000k", ...qualitySettings },
+    { name: "2160p", height: 2160, bitrate: "16000k", ...qualitySettings },
   ];
 
   return allResolutions.filter((res) => res.height <= height);
@@ -110,16 +144,18 @@ function processQueue() {
 async function processVideo(filePath) {
   const fileName = path.basename(filePath, path.extname(filePath));
   const outputDir = path.join(transcodedFolder, fileName);
-
-  if (isVideoAlreadyTranscoded(fileName)) {
-    console.log(`Video ${fileName} has already been transcoded. Skipping.`);
-    return;
-  }
+  const masterPlaylistPath = path.join(outputDir, "master.m3u8");
 
   // Create output directory if it doesn't exist
   if (!fs.existsSync(outputDir)) {
     fs.mkdirSync(outputDir, { recursive: true });
   }
+
+  // Initialize master playlist
+  let masterPlaylist = ["#EXTM3U", "#EXT-X-VERSION:3"];
+
+  // Write initial master playlist file
+  fs.writeFileSync(masterPlaylistPath, masterPlaylist.join("\n"));
 
   // Get video metadata to determine original resolution
   const metadata = await getVideoMetadata(filePath);
@@ -129,31 +165,27 @@ async function processVideo(filePath) {
 
   // Determine which resolutions to generate based on original
   const resolutions = determineResolutions(metadata.height);
-  console.log(
-    `Will generate the following resolutions: ${resolutions
-      .map((r) => r.name)
-      .join(", ")}`
-  );
 
-  // Create master playlist
-  const masterPlaylist = ["#EXTM3U", "#EXT-X-VERSION:3"];
-
-  // Generate each resolution version
+  // Generate each resolution version that hasn't been transcoded
   for (const resolution of resolutions) {
-    await generateResolutionVersion(
-      filePath,
-      fileName,
-      resolution,
-      masterPlaylist,
-      metadata
-    );
-  }
+    if (!isResolutionTranscoded(fileName, resolution.name)) {
+      console.log(`Transcoding ${fileName} to ${resolution.name}`);
+      await generateResolutionVersion(
+        filePath,
+        fileName,
+        resolution,
+        masterPlaylist,
+        metadata
+      );
+    } else {
+      console.log(
+        `Resolution ${resolution.name} for ${fileName} already exists. Skipping.`
+      );
+    }
 
-  // Write master playlist file
-  fs.writeFileSync(
-    path.join(outputDir, "master.m3u8"),
-    masterPlaylist.join("\n")
-  );
+    // Update master playlist file after each resolution
+    fs.writeFileSync(masterPlaylistPath, masterPlaylist.join("\n"));
+  }
 
   console.log(`Completed transcoding for ${fileName}`);
 }
@@ -185,7 +217,13 @@ function generateResolutionVersion(
       );
       masterPlaylist.push(`${resolution.name}/playlist.m3u8`);
 
-      resolve();
+      if (resolution.height > metadata.height) {
+        console.log(
+          `Skipping ${resolution.name} for ${fileName} as it's higher than the original resolution.`
+        );
+        resolve();
+        return;
+      }
       return;
     }
 
@@ -260,26 +298,19 @@ function tryHardwareAcceleration(
   return new Promise((resolve, reject) => {
     const command = ffmpeg(filePath);
 
-    // Apply hardware acceleration options to the INPUT
     command.inputOptions(["-hwaccel videotoolbox"]);
 
-    // Apply output options separately
     command
       .outputOptions([
-        // Video scaling
         `-vf scale=${width}:${resolution.height}`,
-
-        // Video codec settings
-        "-c:v h264_videotoolbox", // Use VideoToolbox hardware encoder
+        "-c:v h264_videotoolbox",
         `-b:v ${resolution.bitrate}`,
+        `-preset ${resolution.preset}`,
+        `-crf ${resolution.crf}`,
         "-profile:v main",
-
-        // Audio settings
         "-c:a aac",
         "-ar 48000",
         "-b:a 128k",
-
-        // HLS settings
         `-hls_time ${SEGMENT_DURATION}`,
         "-hls_list_size 0",
         "-hls_segment_filename",
@@ -337,21 +368,15 @@ function trySoftwareEncoding(
   return new Promise((resolve, reject) => {
     ffmpeg(filePath)
       .outputOptions([
-        // Video scaling
         `-vf scale=${width}:${resolution.height}`,
-
-        // Video codec settings (software)
         "-c:v libx264",
         `-b:v ${resolution.bitrate}`,
-        "-preset medium", // Balance between speed and quality
+        `-preset ${resolution.preset}`,
+        `-crf ${resolution.crf}`,
         "-profile:v main",
-
-        // Audio settings
         "-c:a aac",
         "-ar 48000",
         "-b:a 128k",
-
-        // HLS settings
         `-hls_time ${SEGMENT_DURATION}`,
         "-hls_list_size 0",
         "-hls_segment_filename",

@@ -2,6 +2,7 @@ const express = require("express");
 const fs = require("fs");
 const path = require("path");
 require("dotenv").config();
+// const crypto = require("node:crypto");
 
 const router = express.Router();
 const transcodedFolder = process.env.TRANSCODED_FOLDER_PATH;
@@ -43,13 +44,13 @@ router.get("/videos/:id", (req, res) => {
     const video = {
       id: videoId,
       name: videoId,
-      thumbnail: `/videos/${videoId}/thumbnail.jpg`,
-      url: `/videos/${videoId}/master.m3u8`,
+      thumbnail: "/videos/${videoId}/thumbnail.jpg",
+      url: "/videos/${videoId}/master.m3u8",
       resolutions: ["original"],
     };
 
     // Check for available resolutions
-    const resolutions = ["480p", "720p", "1080p"];
+    const resolutions = ["480p", "720p", "1080p", "1440p", "2160p"];
     resolutions.forEach((resolution) => {
       if (fs.existsSync(path.join(videoPath, resolution))) {
         video.resolutions.push(resolution);
@@ -58,7 +59,7 @@ router.get("/videos/:id", (req, res) => {
 
     res.json(video);
   } catch (error) {
-    console.error(`Error getting video ${videoId}:`, error);
+    console.error("Error getting video ${videoId}:, error");
     res.status(500).json({ error: "Failed to get video details" });
   }
 });
