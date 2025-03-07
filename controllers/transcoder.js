@@ -2,14 +2,13 @@ const ffmpeg = require("fluent-ffmpeg");
 const path = require("path");
 const fs = require("fs");
 require("dotenv").config();
-
 const transcodedFolder = process.env.TRANSCODED_FOLDER_PATH;
 const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS || "1");
 const SEGMENT_DURATION = parseInt(process.env.SEGMENT_DURATION || "20");
 const USE_HARDWARE_ACCELERATION =
   process.env.USE_HARDWARE_ACCELERATION !== "false"; // Default to true
 const QUALITY_PRESET = process.env.QUALITY_PRESET || "medium";
-
+const { generateThumbnail } = require("../utils/thumbnailGenerator");
 // Queue for processing videos sequentially
 const videoQueue = [];
 let activeJobs = 0;
@@ -64,7 +63,6 @@ function isResolutionTranscoded(fileName, resolution) {
       )
     );
   }
-
   return false;
 }
 
@@ -96,14 +94,14 @@ function getVideoMetadata(filePath) {
 
 function getQualityPresetSettings(preset) {
   const presets = {
-    low: { crf: 28, preset: "faster" },
-    medium: { crf: 23, preset: "medium" },
-    high: { crf: 18, preset: "slow" },
+    low: { crf: 28, preset: "veryfast" },
+    medium: { crf: 23, preset: "fast" },
+    high: { crf: 18, preset: "medium" },
   };
   return presets[preset] || presets.medium;
 }
 
-function determineResolutions(height) {
+function determineResolutions(height, width) {
   const qualitySettings = getQualityPresetSettings(QUALITY_PRESET);
   const allResolutions = [
     { name: "480p", height: 480, bitrate: "1000k", ...qualitySettings },
@@ -113,7 +111,21 @@ function determineResolutions(height) {
     { name: "2160p", height: 2160, bitrate: "16000k", ...qualitySettings },
   ];
 
-  return allResolutions.filter((res) => res.height <= height);
+  // Find the next resolution level above the source height
+  let nextLevelIndex = -1;
+  for (let i = 0; i < allResolutions.length; i++) {
+    if (allResolutions[i].height > height) {
+      nextLevelIndex = i;
+      break;
+    }
+  }
+
+  // Return all resolutions up to and including one level above the source
+  return allResolutions.filter(
+    (res, index) =>
+      res.height <= height ||
+      (nextLevelIndex !== -1 && index === nextLevelIndex)
+  );
 }
 
 async function transcodeVideo(filePath) {
@@ -141,6 +153,70 @@ function processQueue() {
     });
 }
 
+// Helper function to read and parse existing master playlist
+function parseExistingMasterPlaylist(masterPlaylistPath) {
+  if (!fs.existsSync(masterPlaylistPath)) {
+    return null;
+  }
+
+  try {
+    const content = fs.readFileSync(masterPlaylistPath, "utf8");
+    const lines = content.split("\n");
+
+    // Basic validation: Should contain #EXTM3U and at least one playlist
+    if (!lines.some((line) => line.startsWith("#EXTM3U"))) {
+      console.log(
+        `Existing master playlist at ${masterPlaylistPath} seems invalid, will recreate`
+      );
+      return null;
+    }
+
+    // Extract existing playlists and their associated info
+    const existingEntries = [];
+    let currentStreamInfo = null;
+
+    for (const line of lines) {
+      if (line.startsWith("#EXT-X-STREAM-INF:")) {
+        currentStreamInfo = line;
+      } else if (currentStreamInfo && line.trim() && !line.startsWith("#")) {
+        existingEntries.push({
+          streamInfo: currentStreamInfo,
+          playlist: line.trim(),
+        });
+        currentStreamInfo = null;
+      }
+    }
+
+    // If we found valid entries, return them
+    if (existingEntries.length > 0) {
+      console.log(
+        `Found ${existingEntries.length} existing resolution entries in master playlist`
+      );
+      return { lines, existingEntries };
+    }
+
+    return null;
+  } catch (err) {
+    console.error(`Error parsing master playlist: ${err.message}`);
+    return null;
+  }
+}
+
+// Helper function to backup existing master playlist
+function backupMasterPlaylist(masterPlaylistPath) {
+  if (!fs.existsSync(masterPlaylistPath)) {
+    return;
+  }
+
+  const backupPath = `${masterPlaylistPath}.backup`;
+  try {
+    fs.copyFileSync(masterPlaylistPath, backupPath);
+    console.log(`Backed up master playlist to ${backupPath}`);
+  } catch (err) {
+    console.error(`Failed to backup master playlist: ${err.message}`);
+  }
+}
+
 async function processVideo(filePath) {
   const fileName = path.basename(filePath, path.extname(filePath));
   const outputDir = path.join(transcodedFolder, fileName);
@@ -151,11 +227,35 @@ async function processVideo(filePath) {
     fs.mkdirSync(outputDir, { recursive: true });
   }
 
-  // Initialize master playlist
-  let masterPlaylist = ["#EXTM3U", "#EXT-X-VERSION:3"];
+  // Check if a valid master playlist already exists and parse it
+  let masterPlaylist;
+  let existingPlaylistData = parseExistingMasterPlaylist(masterPlaylistPath);
 
-  // Write initial master playlist file
-  fs.writeFileSync(masterPlaylistPath, masterPlaylist.join("\n"));
+  if (existingPlaylistData) {
+    console.log(`Using existing master playlist for ${fileName}`);
+    // Use header lines from existing playlist
+    masterPlaylist = existingPlaylistData.lines.filter(
+      (line) => line.startsWith("#") && !line.startsWith("#EXT-X-STREAM-INF:")
+    );
+
+    // Ensure essential headers exist
+    if (!masterPlaylist.includes("#EXTM3U")) {
+      masterPlaylist.unshift("#EXTM3U");
+    }
+    if (!masterPlaylist.includes("#EXT-X-VERSION:3")) {
+      masterPlaylist.push("#EXT-X-VERSION:3");
+    }
+
+    // Create backup of the existing playlist
+    backupMasterPlaylist(masterPlaylistPath);
+  } else {
+    // Initialize a new master playlist
+    masterPlaylist = ["#EXTM3U", "#EXT-X-VERSION:3"];
+    console.log(`Creating new master playlist for ${fileName}`);
+
+    // Write initial master playlist file
+    fs.writeFileSync(masterPlaylistPath, masterPlaylist.join("\n"));
+  }
 
   // Get video metadata to determine original resolution
   const metadata = await getVideoMetadata(filePath);
@@ -164,10 +264,53 @@ async function processVideo(filePath) {
   );
 
   // Determine which resolutions to generate based on original
-  const resolutions = determineResolutions(metadata.height);
+  const resolutions = determineResolutions(metadata.height, metadata.width);
+
+  // Create a set of resolution names from the existing playlist entries
+  const existingResolutions = new Set();
+  if (existingPlaylistData && existingPlaylistData.existingEntries) {
+    existingPlaylistData.existingEntries.forEach((entry) => {
+      // Extract resolution folder name from playlist path
+      const playlistPath = entry.playlist;
+      const resolutionName = playlistPath.split("/")[0];
+      existingResolutions.add(resolutionName);
+    });
+  }
 
   // Generate each resolution version that hasn't been transcoded
   for (const resolution of resolutions) {
+    // Skip if this resolution is already in the master playlist
+    // AND the resolution is actually transcoded fully
+    if (
+      existingResolutions.has(resolution.name) &&
+      isResolutionTranscoded(fileName, resolution.name)
+    ) {
+      console.log(
+        `Resolution ${resolution.name} for ${fileName} already exists in master playlist. Skipping.`
+      );
+
+      // Calculate aspect ratio-correct width for adding back to the playlist
+      const aspectRatio = metadata.width / metadata.height;
+      const width = Math.round(resolution.height * aspectRatio);
+
+      // Add back the existing entry if it's not already in the working playlist
+      const infoLine = `#EXT-X-STREAM-INF:BANDWIDTH=${
+        parseInt(resolution.bitrate) * 1000
+      },RESOLUTION=${width}x${resolution.height}`;
+      const playlistLine = `${resolution.name}/playlist.m3u8`;
+
+      // Only add if this exact entry isn't already in our working playlist
+      if (
+        !masterPlaylist.includes(infoLine) ||
+        !masterPlaylist.includes(playlistLine)
+      ) {
+        masterPlaylist.push(infoLine);
+        masterPlaylist.push(playlistLine);
+      }
+
+      continue;
+    }
+
     if (!isResolutionTranscoded(fileName, resolution.name)) {
       console.log(`Transcoding ${fileName} to ${resolution.name}`);
       await generateResolutionVersion(
@@ -179,11 +322,23 @@ async function processVideo(filePath) {
       );
     } else {
       console.log(
-        `Resolution ${resolution.name} for ${fileName} already exists. Skipping.`
+        `Resolution ${resolution.name} for ${fileName} already exists but needs to be added to master playlist.`
       );
+
+      // Calculate aspect ratio-correct width
+      const aspectRatio = metadata.width / metadata.height;
+      const width = Math.round(resolution.height * aspectRatio);
+
+      // Add to master playlist
+      masterPlaylist.push(
+        `#EXT-X-STREAM-INF:BANDWIDTH=${
+          parseInt(resolution.bitrate) * 1000
+        },RESOLUTION=${width}x${resolution.height}`
+      );
+      masterPlaylist.push(`${resolution.name}/playlist.m3u8`);
     }
 
-    // Update master playlist file after each resolution
+    // Update master playlist file after each resolution is processed
     fs.writeFileSync(masterPlaylistPath, masterPlaylist.join("\n"));
   }
 
@@ -295,6 +450,7 @@ function tryHardwareAcceleration(
   width,
   masterPlaylist
 ) {
+  const tempOutputPath = path.join(resolutionDir, "playlist.m3u8.tmp");
   return new Promise((resolve, reject) => {
     const command = ffmpeg(filePath);
 
@@ -316,8 +472,9 @@ function tryHardwareAcceleration(
         "-hls_segment_filename",
         `${resolutionDir}/segment_%03d.ts`,
         "-f hls",
+        "-g 48",
       ])
-      .output(outputPath)
+      .output(tempOutputPath)
       .on("start", () => {
         console.log(
           `Started transcoding ${fileName} to ${resolution.name} with hardware acceleration`
@@ -334,15 +491,14 @@ function tryHardwareAcceleration(
         console.log(
           `Finished transcoding ${fileName} to ${resolution.name} with hardware acceleration`
         );
-
-        // Add to master playlist
+        // Atomically rename the .tmp file to the final output for hardware encoding as well
+        fs.renameSync(tempOutputPath, outputPath);
         masterPlaylist.push(
           `#EXT-X-STREAM-INF:BANDWIDTH=${
             parseInt(resolution.bitrate) * 1000
           },RESOLUTION=${width}x${resolution.height}`
         );
         masterPlaylist.push(`${resolution.name}/playlist.m3u8`);
-
         resolve();
       })
       .on("error", (err) => {
@@ -350,6 +506,10 @@ function tryHardwareAcceleration(
           `Error transcoding ${fileName} to ${resolution.name} with hardware acceleration:`,
           err
         );
+        // Clean up the temporary file if it exists
+        if (fs.existsSync(tempOutputPath)) {
+          fs.unlinkSync(tempOutputPath);
+        }
         reject(err);
       })
       .run();
@@ -365,25 +525,28 @@ function trySoftwareEncoding(
   width,
   masterPlaylist
 ) {
+  const tempOutputPath = path.join(resolutionDir, "playlist.m3u8.tmp");
   return new Promise((resolve, reject) => {
     ffmpeg(filePath)
       .outputOptions([
         `-vf scale=${width}:${resolution.height}`,
         "-c:v libx264",
+        "-threads 0",
         `-b:v ${resolution.bitrate}`,
         `-preset ${resolution.preset}`,
         `-crf ${resolution.crf}`,
         "-profile:v main",
         "-c:a aac",
         "-ar 48000",
-        "-b:a 128k",
+        "-b:a 192k",
         `-hls_time ${SEGMENT_DURATION}`,
         "-hls_list_size 0",
         "-hls_segment_filename",
         `${resolutionDir}/segment_%03d.ts`,
         "-f hls",
+        "-g 48",
       ])
-      .output(outputPath)
+      .output(tempOutputPath)
       .on("start", () => {
         console.log(
           `Started transcoding ${fileName} to ${resolution.name} with software encoding`
@@ -400,15 +563,14 @@ function trySoftwareEncoding(
         console.log(
           `Finished transcoding ${fileName} to ${resolution.name} with software encoding`
         );
-
-        // Add to master playlist
+        // Atomically rename the .tmp file to the final output
+        fs.renameSync(tempOutputPath, outputPath);
         masterPlaylist.push(
           `#EXT-X-STREAM-INF:BANDWIDTH=${
             parseInt(resolution.bitrate) * 1000
           },RESOLUTION=${width}x${resolution.height}`
         );
         masterPlaylist.push(`${resolution.name}/playlist.m3u8`);
-
         resolve();
       })
       .on("error", (err) => {
@@ -416,6 +578,10 @@ function trySoftwareEncoding(
           `Error transcoding ${fileName} to ${resolution.name} with software encoding:`,
           err
         );
+        // Remove any temporary files that may have been created
+        if (fs.existsSync(tempOutputPath)) {
+          fs.unlinkSync(tempOutputPath);
+        }
         reject(err);
       })
       .run();
