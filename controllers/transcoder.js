@@ -3,23 +3,38 @@ const path = require("path");
 const fs = require("fs");
 require("dotenv").config();
 const transcodedFolder = process.env.TRANSCODED_FOLDER_PATH;
-const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS || "1");
 const SEGMENT_DURATION = parseInt(process.env.SEGMENT_DURATION || "20");
 const USE_HARDWARE_ACCELERATION =
   process.env.USE_HARDWARE_ACCELERATION !== "false"; // Default to true
 const QUALITY_PRESET = process.env.QUALITY_PRESET || "medium";
-const { generateThumbnail } = require("../utils/thumbnailGenerator");
-// Queue for processing videos sequentially
 const videoQueue = [];
 let activeJobs = 0;
+const cliProgress = require("cli-progress");
+const os = require("os");
+const MAX_CONCURRENT_JOBS = Math.max(1, Math.floor(os.cpus().length / 2));
+
+// Create a global multi progress bar instance
+const multiBar = new cliProgress.MultiBar(
+  {
+    clearOnComplete: false,
+    hideCursor: true,
+    format: "[{bar}] {percentage}% | {file} | Frame: {frame} | Speed: {speed}",
+    barCompleteChar: "█",
+    barIncompleteChar: "░",
+    forceRedraw: true,
+    noTTYOutput: true,
+    notTTYSchedule: 100,
+  },
+  cliProgress.Presets.shades_grey
+);
 
 // Ensure transcoded folder exists
 if (!fs.existsSync(transcodedFolder)) {
   fs.mkdirSync(transcodedFolder, { recursive: true });
 }
 
-function isVideoAlreadyTranscoded(fileName) {
-  const outputDir = path.join(transcodedFolder, fileName);
+function isVideoAlreadyTranscoded(fileName, relativeDir = "") {
+  const outputDir = path.join(transcodedFolder, relativeDir, fileName);
   const masterPlaylistPath = path.join(outputDir, "master.m3u8");
 
   if (fs.existsSync(masterPlaylistPath)) {
@@ -46,8 +61,13 @@ function isVideoAlreadyTranscoded(fileName) {
   return false;
 }
 
-function isResolutionTranscoded(fileName, resolution) {
-  const resolutionDir = path.join(transcodedFolder, fileName, resolution);
+function isResolutionTranscoded(fileName, resolution, relativeDir = "") {
+  const resolutionDir = path.join(
+    transcodedFolder,
+    relativeDir,
+    fileName,
+    resolution
+  );
   const playlistPath = path.join(resolutionDir, "playlist.m3u8");
 
   if (fs.existsSync(playlistPath)) {
@@ -129,9 +149,13 @@ function determineResolutions(height, width) {
 }
 
 async function transcodeVideo(filePath) {
-  // Add to queue and process if no active jobs
+  // Get relative path from VIDEO_FOLDER_PATH
+  const relativePath = path.relative(process.env.VIDEO_FOLDER_PATH, filePath);
+  const relativeDir = path.dirname(relativePath);
+
+  // Add to queue with relative path information
   return new Promise((resolve, reject) => {
-    videoQueue.push({ filePath, resolve, reject });
+    videoQueue.push({ filePath, relativeDir, resolve, reject });
     processQueue();
   });
 }
@@ -142,9 +166,9 @@ function processQueue() {
   }
 
   activeJobs++;
-  const { filePath, resolve, reject } = videoQueue.shift();
+  const { filePath, relativeDir, resolve, reject } = videoQueue.shift();
 
-  processVideo(filePath)
+  processVideo(filePath, relativeDir)
     .then(resolve)
     .catch(reject)
     .finally(() => {
@@ -217,9 +241,9 @@ function backupMasterPlaylist(masterPlaylistPath) {
   }
 }
 
-async function processVideo(filePath) {
+async function processVideo(filePath, relativeDir = "") {
   const fileName = path.basename(filePath, path.extname(filePath));
-  const outputDir = path.join(transcodedFolder, fileName);
+  const outputDir = path.join(transcodedFolder, relativeDir, fileName);
   const masterPlaylistPath = path.join(outputDir, "master.m3u8");
 
   // Create output directory if it doesn't exist
@@ -283,7 +307,7 @@ async function processVideo(filePath) {
     // AND the resolution is actually transcoded fully
     if (
       existingResolutions.has(resolution.name) &&
-      isResolutionTranscoded(fileName, resolution.name)
+      isResolutionTranscoded(fileName, resolution.name, relativeDir)
     ) {
       console.log(
         `Resolution ${resolution.name} for ${fileName} already exists in master playlist. Skipping.`
@@ -311,7 +335,7 @@ async function processVideo(filePath) {
       continue;
     }
 
-    if (!isResolutionTranscoded(fileName, resolution.name)) {
+    if (!isResolutionTranscoded(fileName, resolution.name, relativeDir)) {
       console.log(`Transcoding ${fileName} to ${resolution.name}`);
       await generateResolutionVersion(
         filePath,
@@ -353,10 +377,12 @@ function generateResolutionVersion(
   metadata
 ) {
   return new Promise((resolve, reject) => {
-    const outputDir = path.join(transcodedFolder, fileName);
+    const relativePath = path.relative(process.env.VIDEO_FOLDER_PATH, filePath);
+    const relativeDir = path.dirname(relativePath);
+    const outputDir = path.join(transcodedFolder, relativeDir, fileName);
     const resolutionDir = path.join(outputDir, resolution.name);
 
-    if (isResolutionTranscoded(fileName, resolution.name)) {
+    if (isResolutionTranscoded(fileName, resolution.name, relativeDir)) {
       console.log(
         `Resolution ${resolution.name} for ${fileName} already exists. Skipping.`
       );
@@ -453,8 +479,14 @@ function tryHardwareAcceleration(
   const tempOutputPath = path.join(resolutionDir, "playlist.m3u8.tmp");
   return new Promise((resolve, reject) => {
     const command = ffmpeg(filePath);
-
     command.inputOptions(["-hwaccel videotoolbox"]);
+
+    // Create a progress bar instance from the global multiBar
+    const progressBar = multiBar.create(100, 0, {
+      file: `${fileName} ${resolution.name}`,
+      frame: 0,
+      speed: "0fps",
+    });
 
     command
       .outputOptions([
@@ -472,7 +504,11 @@ function tryHardwareAcceleration(
         "-hls_segment_filename",
         `${resolutionDir}/segment_%03d.ts`,
         "-f hls",
-        "-g 48",
+        `-g 48`, // Optimize keyframe interval
+        "-sc_threshold 0", // Disable scene change detection
+        "-tune fastdecode",
+        "-threads 0", // Let FFmpeg decide optimal thread count
+        "-thread_type slice",
       ])
       .output(tempOutputPath)
       .on("start", () => {
@@ -481,17 +517,21 @@ function tryHardwareAcceleration(
         );
       })
       .on("progress", (progress) => {
-        console.log(
-          `Processing: ${fileName} (${resolution.name}) - ${
-            progress.percent ? progress.percent.toFixed(2) : "0"
-          }% done`
-        );
+        const perc = Math.min(100, progress.percent || 0);
+        progressBar.update(perc, {
+          file: `${fileName} ${resolution.name}`,
+          frame: progress.frames || 0,
+          speed: progress.currentFps ? `${progress.currentFps}fps` : "0fps",
+        });
       })
       .on("end", () => {
+        progressBar.update(100);
+        progressBar.stop();
+        // Remove the progress bar from multiBar
+        multiBar.remove(progressBar);
         console.log(
           `Finished transcoding ${fileName} to ${resolution.name} with hardware acceleration`
         );
-        // Atomically rename the .tmp file to the final output for hardware encoding as well
         fs.renameSync(tempOutputPath, outputPath);
         masterPlaylist.push(
           `#EXT-X-STREAM-INF:BANDWIDTH=${
@@ -502,11 +542,13 @@ function tryHardwareAcceleration(
         resolve();
       })
       .on("error", (err) => {
+        progressBar.stop();
+        // Remove the progress bar from multiBar
+        multiBar.remove(progressBar);
         console.error(
           `Error transcoding ${fileName} to ${resolution.name} with hardware acceleration:`,
           err
         );
-        // Clean up the temporary file if it exists
         if (fs.existsSync(tempOutputPath)) {
           fs.unlinkSync(tempOutputPath);
         }
@@ -527,6 +569,13 @@ function trySoftwareEncoding(
 ) {
   const tempOutputPath = path.join(resolutionDir, "playlist.m3u8.tmp");
   return new Promise((resolve, reject) => {
+    // Create a progress bar instance from the global multiBar
+    const progressBar = multiBar.create(100, 0, {
+      file: `${fileName} ${resolution.name}`,
+      frame: 0,
+      speed: "0fps",
+    });
+
     ffmpeg(filePath)
       .outputOptions([
         `-vf scale=${width}:${resolution.height}`,
@@ -544,7 +593,11 @@ function trySoftwareEncoding(
         "-hls_segment_filename",
         `${resolutionDir}/segment_%03d.ts`,
         "-f hls",
-        "-g 48",
+        `-g 48`, // Optimize keyframe interval
+        "-sc_threshold 0", // Disable scene change detection
+        "-tune fastdecode",
+        "-threads 0", // Let FFmpeg decide optimal thread count
+        "-thread_type slice",
       ])
       .output(tempOutputPath)
       .on("start", () => {
@@ -553,17 +606,21 @@ function trySoftwareEncoding(
         );
       })
       .on("progress", (progress) => {
-        console.log(
-          `Processing: ${fileName} (${resolution.name}) - ${
-            progress.percent ? progress.percent.toFixed(2) : "0"
-          }% done`
-        );
+        const perc = Math.min(100, progress.percent || 0);
+        progressBar.update(perc, {
+          file: `${fileName} ${resolution.name}`,
+          frame: progress.frames || 0,
+          speed: progress.currentFps ? `${progress.currentFps}fps` : "0fps",
+        });
       })
       .on("end", () => {
+        progressBar.update(100);
+        progressBar.stop();
+        // Remove the progress bar from multiBar
+        multiBar.remove(progressBar);
         console.log(
           `Finished transcoding ${fileName} to ${resolution.name} with software encoding`
         );
-        // Atomically rename the .tmp file to the final output
         fs.renameSync(tempOutputPath, outputPath);
         masterPlaylist.push(
           `#EXT-X-STREAM-INF:BANDWIDTH=${
@@ -574,11 +631,13 @@ function trySoftwareEncoding(
         resolve();
       })
       .on("error", (err) => {
+        progressBar.stop();
+        // Remove the progress bar from multiBar
+        multiBar.remove(progressBar);
         console.error(
           `Error transcoding ${fileName} to ${resolution.name} with software encoding:`,
           err
         );
-        // Remove any temporary files that may have been created
         if (fs.existsSync(tempOutputPath)) {
           fs.unlinkSync(tempOutputPath);
         }
