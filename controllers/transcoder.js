@@ -11,7 +11,17 @@ const videoQueue = [];
 let activeJobs = 0;
 const cliProgress = require("cli-progress");
 const os = require("os");
-const MAX_CONCURRENT_JOBS = Math.max(1, Math.floor(os.cpus().length / 2));
+const MAX_CONCURRENT_JOBS =
+  process.env.MAX_CONCURRENT_JOBS ||
+  Math.max(1, Math.floor(os.cpus().length / 2));
+const PRIORITY_ORDER = {
+  "2160p": 1,
+  "1440p": 2,
+  "1080p": 3,
+  "720p": 4,
+  "480p": 5,
+};
+const { generateThumbnail } = require("../utils/thumbnailGenerator"); // Adjust relative path if needed
 
 // Create a global multi progress bar instance
 const multiBar = new cliProgress.MultiBar(
@@ -149,15 +159,49 @@ function determineResolutions(height, width) {
 }
 
 async function transcodeVideo(filePath) {
-  // Get relative path from VIDEO_FOLDER_PATH
   const relativePath = path.relative(process.env.VIDEO_FOLDER_PATH, filePath);
   const relativeDir = path.dirname(relativePath);
 
-  // Add to queue with relative path information
+  // Get video metadata for priority calculation
+  const metadata = await getVideoMetadata(filePath);
+  const priority = calculatePriority(metadata);
+
+  // Add to queue with priority
   return new Promise((resolve, reject) => {
-    videoQueue.push({ filePath, relativeDir, resolve, reject });
+    videoQueue.push({
+      filePath,
+      relativeDir,
+      resolve,
+      reject,
+      priority,
+      duration: metadata.duration,
+      addedTime: Date.now(),
+    });
+
+    // Sort queue by duration first, then by resolution priority
+    videoQueue.sort((a, b) => {
+      if (a.duration !== b.duration) {
+        return a.duration - b.duration; // Shortest first
+      }
+      return a.priority - b.priority; // Then by resolution priority
+    });
     processQueue();
   });
+}
+
+function calculatePriority(metadata) {
+  // Lower number = higher priority
+  let priority = 100;
+
+  // Prioritize by resolution
+  const height = metadata.height;
+  if (height >= 2160) priority = PRIORITY_ORDER["2160p"];
+  else if (height >= 1440) priority = PRIORITY_ORDER["1440p"];
+  else if (height >= 1080) priority = PRIORITY_ORDER["1080p"];
+  else if (height >= 720) priority = PRIORITY_ORDER["720p"];
+  else priority = PRIORITY_ORDER["480p"];
+
+  return priority;
 }
 
 function processQueue() {
@@ -242,7 +286,11 @@ function backupMasterPlaylist(masterPlaylistPath) {
 }
 
 async function processVideo(filePath, relativeDir = "") {
-  const fileName = path.basename(filePath, path.extname(filePath));
+  // Replace spaces with dots in fileName
+  const fileName = path
+    .basename(filePath, path.extname(filePath))
+    .replace(/\s+/g, ".");
+  // Include fileName in the output folder path
   const outputDir = path.join(transcodedFolder, relativeDir, fileName);
   const masterPlaylistPath = path.join(outputDir, "master.m3u8");
 
@@ -379,6 +427,7 @@ function generateResolutionVersion(
   return new Promise((resolve, reject) => {
     const relativePath = path.relative(process.env.VIDEO_FOLDER_PATH, filePath);
     const relativeDir = path.dirname(relativePath);
+    // Include fileName in the output directory
     const outputDir = path.join(transcodedFolder, relativeDir, fileName);
     const resolutionDir = path.join(outputDir, resolution.name);
 
@@ -405,6 +454,7 @@ function generateResolutionVersion(
         resolve();
         return;
       }
+      resolve();
       return;
     }
 
@@ -498,7 +548,8 @@ function tryHardwareAcceleration(
         "-profile:v main",
         "-c:a aac",
         "-ar 48000",
-        "-b:a 128k",
+        "-b:a 256k", // Increased audio bitrate for improved quality
+        "-ac 2",
         `-hls_time ${SEGMENT_DURATION}`,
         "-hls_list_size 0",
         "-hls_segment_filename",
@@ -527,7 +578,6 @@ function tryHardwareAcceleration(
       .on("end", () => {
         progressBar.update(100);
         progressBar.stop();
-        // Remove the progress bar from multiBar
         multiBar.remove(progressBar);
         console.log(
           `Finished transcoding ${fileName} to ${resolution.name} with hardware acceleration`
@@ -539,6 +589,8 @@ function tryHardwareAcceleration(
           },RESOLUTION=${width}x${resolution.height}`
         );
         masterPlaylist.push(`${resolution.name}/playlist.m3u8`);
+        // Call generateThumbnail with the directory of the transcoded resolution
+        generateThumbnail(resolutionDir);
         resolve();
       })
       .on("error", (err) => {
@@ -587,7 +639,8 @@ function trySoftwareEncoding(
         "-profile:v main",
         "-c:a aac",
         "-ar 48000",
-        "-b:a 192k",
+        "-b:a 256k", // Increased audio bitrate for improved quality
+        "-ac 2",
         `-hls_time ${SEGMENT_DURATION}`,
         "-hls_list_size 0",
         "-hls_segment_filename",
@@ -616,7 +669,6 @@ function trySoftwareEncoding(
       .on("end", () => {
         progressBar.update(100);
         progressBar.stop();
-        // Remove the progress bar from multiBar
         multiBar.remove(progressBar);
         console.log(
           `Finished transcoding ${fileName} to ${resolution.name} with software encoding`
@@ -628,6 +680,8 @@ function trySoftwareEncoding(
           },RESOLUTION=${width}x${resolution.height}`
         );
         masterPlaylist.push(`${resolution.name}/playlist.m3u8`);
+        // Call generateThumbnail with the directory of the transcoded resolution
+        generateThumbnail(resolutionDir);
         resolve();
       })
       .on("error", (err) => {

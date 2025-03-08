@@ -1,0 +1,39 @@
+const fs = require("fs");
+const path = require("path");
+const ffmpeg = require("fluent-ffmpeg");
+
+function generateThumbnail(directoryPath) {
+  fs.readdir(directoryPath, (err, files) => {
+    if (err) {
+      console.error("Error reading directory:", err);
+      return;
+    }
+
+    const tsFiles = files.filter((file) => path.extname(file) === ".ts");
+    if (tsFiles.length < 1) {
+      console.error("Not enough .ts files in the directory.");
+      return;
+    }
+
+    const targetFile = path.join(directoryPath, tsFiles[0]);
+    const outputThumbnail = path.join(directoryPath, "..", "thumbnail.jpg");
+
+    ffmpeg(targetFile)
+      .on("end", () => {
+        console.log("Thumbnail generated successfully.");
+      })
+      .on("error", (err) => {
+        console.error("Error generating thumbnail:", err);
+      })
+      .screenshots({
+        count: 1,
+        folder: path.dirname(outputThumbnail),
+        filename: path.basename(outputThumbnail),
+        size: "320x240",
+      });
+  });
+}
+
+module.exports = {
+  generateThumbnail,
+};
